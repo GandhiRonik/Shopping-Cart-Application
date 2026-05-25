@@ -1,0 +1,158 @@
+# =============================================================================
+# docker-compose.yml — Shopping Cart Application
+#
+# Usage:
+#   docker compose up -d          # start all services
+#   docker compose logs -f app    # follow app logs
+#   docker compose down -v        # stop and remove volumes
+#
+# Secrets are loaded from a .env file (never commit .env to git).
+# Copy .env.example to .env and fill in values before running.
+# =============================================================================
+
+services:
+
+  # ── Application ─────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production          # build only the final stage
+      args:
+        APP_UID: 1001
+        APP_GID: 1001
+    image: shopping-cart:local    # local tag; ECR tag is applied by push script
+    container_name: shopping-cart-app
+    restart: unless-stopped
+
+    # Port mapping: host:container
+    # In production on EC2 the host port is 80 (Nginx forwards to 3000 directly).
+    # Locally we expose on 3000 to avoid needing sudo.
+    ports:
+      - "3000:3000"
+
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      LOG_LEVEL: info
+      # ── Secrets — loaded from .env file (see .env.example) ──
+      SESSION_SECRET: ${SESSION_SECRET}
+      MONGODB_URI: ${MONGODB_URI}
+
+    env_file:
+      - .env                      # local overrides; never committed
+
+    # Health check mirrors Dockerfile HEALTHCHECK so compose knows when ready
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+    depends_on:
+      mongo:
+        condition: service_healthy  # wait until MongoDB passes its health check
+
+    networks:
+      - app-net
+
+    # Limit resources to prevent a runaway container on the host
+    deploy:
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+    # Read-only root filesystem — mounts /tmp as tmpfs for writable scratch space
+    read_only: true
+    tmpfs:
+      - /tmp
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── MongoDB (local dev only — use Atlas or DocumentDB in production) ─────────
+  mongo:
+    image: mongo:7-jammy
+    container_name: shopping-cart-mongo
+    restart: unless-stopped
+
+    # Only expose MongoDB on loopback — never bind to 0.0.0.0 in production
+    ports:
+      - "127.0.0.1:27017:27017"
+
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_INITDB_ROOT_USERNAME:-admin}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_INITDB_ROOT_PASSWORD:-changeme}
+      MONGO_INITDB_DATABASE: ${MONGO_DB_NAME:-shopping_cart}
+
+    volumes:
+      - mongo-data:/data/db
+      - ./mongo-init:/docker-entrypoint-initdb.d:ro  # optional init scripts
+
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+    networks:
+      - app-net
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ── Nginx reverse proxy (mirrors EC2 production setup locally) ───────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: shopping-cart-nginx
+    restart: unless-stopped
+
+    ports:
+      - "80:80"
+
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+
+    depends_on:
+      app:
+        condition: service_healthy
+
+    networks:
+      - app-net
+
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  app-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  mongo-data:
+    driver: local
