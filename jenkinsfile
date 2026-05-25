@@ -1,0 +1,110 @@
+pipeline {
+    agent {
+        label 'ec2-agent'
+    }
+
+    environment {
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = '514482197514'
+        ECR_REPO_NAME  = 'shopping-cart'
+        ECR_REGISTRY   = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        
+        EC2_USER       = 'ubuntu'
+        EC2_HOST       = '13.216.3.15' 
+        APP_PORT       = '3000'
+        CONTAINER_NAME = 'my-app-container'
+    }
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 30, unit: 'MINUTES')
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                echo "📥 Checking out source code from GitHub..."
+                git branch: 'master', url: 'https://github.com/GandhiRonik/Shopping-Cart-Application.git'
+                
+                script {
+                    env.SHORT_COMMIT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.SHORT_COMMIT}"
+                    env.FULL_IMAGE_NAME = "${env.ECR_REGISTRY}/${env.ECR_REPO_NAME}:${env.IMAGE_TAG}"
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                echo "🐳 Building Docker image: ${FULL_IMAGE_NAME}"
+                sh """
+                    docker build \\
+                        --build-arg BUILD_NUMBER=${BUILD_NUMBER} \\
+                        -t ${FULL_IMAGE_NAME} \\
+                        -t ${ECR_REGISTRY}/${ECR_REPO_NAME}:latest \\
+                        .
+                    echo "✅ Docker image built successfully"
+                """
+            }
+        }
+
+        stage('Push to AWS ECR') {
+            steps {
+                echo "🚀 Pushing Docker image to AWS ECR..."
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \\
+                    docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    docker push ${FULL_IMAGE_NAME}
+                    docker push ${ECR_REGISTRY}/${ECR_REPO_NAME}:latest
+                """
+            }
+        }
+
+        stage('Deploy to EC2') {
+            steps {
+                echo "🎯 Deploying application to target server..."
+                sshagent(credentials: ['ec2-agent-ssh-key']) {
+                    sh """
+                        ssh -o StrictHostKeyChecking=no ${EC2_USER}@${EC2_HOST} 'bash -s' << 'ENDSSH'
+                            set -e
+
+                            /usr/local/bin/aws ecr get-login-password --region ${AWS_REGION} | \\
+                            docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                            docker pull ${FULL_IMAGE_NAME}
+
+                            docker stop ${CONTAINER_NAME} 2>/dev/null || true
+                            docker rm   ${CONTAINER_NAME} 2>/dev/null || true
+
+                            docker run -d \\
+                                --name ${CONTAINER_NAME} \\
+                                --restart unless-stopped \\
+                                -p ${APP_PORT}:${APP_PORT} \\
+                                ${FULL_IMAGE_NAME}
+
+                            echo "✅ Container started successfully"
+ENDSSH
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "✅ PIPELINE SUCCEEDED"
+        }
+        failure {
+            echo "❌ Pipeline FAILED"
+        }
+        always {
+            sh """
+                docker rmi ${FULL_IMAGE_NAME} 2>/dev/null || true
+                docker rmi ${ECR_REGISTRY}/${ECR_REPO_NAME}:latest 2>/dev/null || true
+                docker image prune -f 2>/dev/null || true
+            """
+        }
+    }
+}
